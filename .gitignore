@@ -1,0 +1,16 @@
+# Dependencies
+node_modules/
+
+# Local editor / tool config
+.claude/
+.DS_Store
+
+# Downloaded content — never commit media or torrent state
+*.mkv
+*.mp4
+*.avi
+*.mov
+*.m4v
+*.webm
+*.torrent
+*.aria2

@@ -1,0 +1,25 @@
+{
+  "name": "dmt-cli",
+  "version": "1.0.0",
+  "description": "dmt — a lightweight, blazingly fast BitTorrent client and torrent search tool for the terminal",
+  "type": "module",
+  "bin": {
+    "dmt": "./src/index.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "keywords": [
+    "bittorrent",
+    "torrent",
+    "cli",
+    "tui",
+    "search",
+    "download"
+  ],
+  "license": "MIT",
+  "dependencies": {
+    "@inquirer/prompts": "^8.5.2",
+    "commander": "^15.0.0"
+  }
+}
