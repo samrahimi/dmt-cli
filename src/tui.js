@@ -11,7 +11,7 @@ function resultLabel(r) {
 
 // Run the interactive flow. If initialQuery is given, the first search runs
 // immediately; otherwise the user is prompted for a query.
-export async function runTui({ initialQuery, out, downLimit = '500M', upLimit = '50M' } = {}) {
+export async function runTui({ initialQuery, out, downLimit = '500M', upLimit = '1M' } = {}) {
   let query = initialQuery;
 
   while (true) {

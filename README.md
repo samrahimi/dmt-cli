@@ -39,7 +39,7 @@ dmt "some cool movie" --headless --1080p   # unattended: LLM picks the best resu
 | `--headless` | Run unattended. No prompts. Exit `0` on success, `1` on failure. |
 | `-o, --out <dir>` | Download directory (default: current directory). |
 | `--down-limit <rate>` | Cap download speed, e.g. `5M`, `500K` (default: `500M`; `0` = unlimited). |
-| `--up-limit <rate>` | Cap upload speed, e.g. `1M` (default: `50M`; `0` = unlimited). |
+| `--up-limit <rate>` | Cap upload speed, e.g. `1M` (default: `1M`; `0` = unlimited). |
 | `--1080p` / `--720p` / `--4k` | Resolution preference hint for headless LLM selection. |
 | `-V, --version` | Print version. |
 | `-h, --help` | Show help. |

@@ -8,7 +8,9 @@
 // Behaviour:
 //  * We seed while downloading (BitTorrent tit-for-tat, which speeds up the
 //    fetch) but stop the instant it completes: `--seed-time=0`. Nothing else is
-//    ever seeded.
+//    ever seeded. Upload is capped at 1 MB/s by default (`upLimit`).
+//  * In RPC mode aria2 never exits on its own, even once every download has
+//    finished, so we detect completion by polling and shut it down ourselves.
 //  * Downloads resume. aria2 keeps a control file and, with
 //    `--check-integrity=true`, hash-verifies whatever is already on disk on
 //    startup — so an interrupted transfer continues from where it left off.
@@ -27,6 +29,7 @@ const STATUS_KEYS = [
   'completedLength',
   'downloadSpeed',
   'uploadSpeed',
+  'uploadLength',
   'connections',
   'numSeeders',
   'bittorrent',
@@ -78,13 +81,14 @@ function progressLine(d) {
   const progress = total ? Math.min(done / total, 1) : 0;
   const dl = Number(d.downloadSpeed || 0);
   const ul = Number(d.uploadSpeed || 0);
+  const uploaded = Number(d.uploadLength || 0);
   const conn = Number(d.connections || 0);
   const seeds = Number(d.numSeeders || 0);
   const eta = dl > 0 ? (total - done) / dl : Infinity;
   return (
     `${renderBar(progress)} ${(progress * 100).toFixed(1)}%  ` +
     `${humanBytes(done)} / ${humanBytes(total)}  ` +
-    `↓ ${humanSpeed(dl)}  ↑ ${humanSpeed(ul)}  ` +
+    `↓ ${humanSpeed(dl)}  ↑ ${humanSpeed(ul)} (${humanBytes(uploaded)} sent)  ` +
     `peers:${conn} seeds:${seeds}  ` +
     `ETA ${humanDuration(eta)}`
   );
@@ -97,11 +101,11 @@ function statusName(d, input) {
 }
 
 // Download a torrent by id (magnet URI or path to a .torrent file), resuming
-// from on-disk state if aria2 exits with an error.
+// from on-disk state if aria2 fails.
 // Options: { out, quiet, maxRetries }. Resolves when the download completes.
 export async function download(
   torrentId,
-  { out = process.cwd(), quiet = false, maxRetries = 8, downLimit = '500M', upLimit = '50M' } = {}
+  { out = process.cwd(), quiet = false, maxRetries = 8, downLimit = '500M', upLimit = '1M' } = {}
 ) {
   let retries = 0;
   for (;;) {
@@ -136,9 +140,26 @@ export async function download(
   }
 }
 
-// One aria2c run. Resolves when aria2 exits 0 (download complete); rejects with a
-// resumable error on non-zero exit, or a fatal error if aria2c can't be run.
-function attemptDownload(input, { out, quiet, resuming, downLimit = '500M', upLimit = '50M' }) {
+// Inspect aria2's queues. Returns null while work remains, otherwise
+// { stopped } — every download aria2 has finished with (complete or errored).
+async function checkFinished(port, secret) {
+  const [active, waiting, stopped] = await Promise.all([
+    rpc(port, secret, 'aria2.tellActive', [['gid']]),
+    rpc(port, secret, 'aria2.tellWaiting', [0, 1000, ['gid']]),
+    rpc(port, secret, 'aria2.tellStopped', [0, 1000, [...STATUS_KEYS, 'followedBy', 'errorMessage']]),
+  ]);
+  if (active.length || waiting.length || stopped.length === 0) return null;
+  // A finished magnet-metadata fetch hands off to a follow-up download; don't
+  // call it done until those follow-ups have finished too.
+  const gids = new Set(stopped.map((d) => d.gid));
+  const pending = stopped.some((d) => (d.followedBy || []).some((g) => !gids.has(g)));
+  return pending ? null : { stopped };
+}
+
+// One aria2c run. Resolves once aria2 reports every download complete; rejects
+// with a resumable error if a download errors or aria2 exits unexpectedly, or a
+// fatal error if aria2c can't be run.
+function attemptDownload(input, { out, quiet, resuming, downLimit = '500M', upLimit = '1M' }) {
   return new Promise((resolve, reject) => {
     const port = randomPort();
     const secret = randomSecret();
@@ -176,7 +197,7 @@ function attemptDownload(input, { out, quiet, resuming, downLimit = '500M', upLi
       '--dht-listen-port=6881-6899',
       '--file-allocation=none', // don't stall at start pre-allocating the file
       `--max-overall-download-limit=${downLimit}`, // 0 = unlimited
-      `--max-overall-upload-limit=${upLimit}`, // 0 = unlimited
+      `--max-overall-upload-limit=${upLimit}`, // seeding cap while downloading; 0 = unlimited
       input,
     ];
 
@@ -225,15 +246,20 @@ function attemptDownload(input, { out, quiet, resuming, downLimit = '500M', upLi
       finish(() => reject(fatal));
     });
 
+    function complete(d) {
+      finish(() =>
+        resolve({
+          name: statusName(d, input),
+          size: Number(d?.totalLength || 0),
+          uploaded: Number(d?.uploadLength || 0),
+          path: out,
+        })
+      );
+    }
+
     child.on('exit', (code) => {
       if (code === 0) {
-        finish(() =>
-          resolve({
-            name: statusName(last, input),
-            size: Number(last?.totalLength || 0),
-            path: out,
-          })
-        );
+        complete(last);
       } else {
         const detail =
           stderrTail.trim().split('\n').filter(Boolean).pop() || `aria2c exited with code ${code}`;
@@ -247,16 +273,33 @@ function attemptDownload(input, { out, quiet, resuming, downLimit = '500M', upLi
 
     // Poll aria2 for progress once a second. RPC may refuse connections until
     // aria2 has bound the port — those early failures are ignored.
+    let polling = false;
     ticker = setInterval(async () => {
+      if (polling || settled) return;
+      polling = true;
       try {
         const active = await rpc(port, secret, 'aria2.tellActive', [STATUS_KEYS]);
         const d = pickDownload(active);
         if (d) {
           last = d;
           render(d);
+        } else {
+          const done = await checkFinished(port, secret);
+          if (done) {
+            const failed = done.stopped.find((s) => s.status === 'error');
+            if (failed) {
+              finish(() => reject(new Error(failed.errorMessage || 'aria2 reported a download error')));
+            } else {
+              const final = pickDownload(done.stopped);
+              if (final) render(final);
+              complete(final);
+            }
+          }
         }
       } catch {
         /* aria2 not ready yet, or a transient RPC hiccup */
+      } finally {
+        polling = false;
       }
     }, 1000);
   });

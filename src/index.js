@@ -27,7 +27,7 @@ program
   .option('--headless', 'run unattended: no interaction, exit 0 on success / 1 on failure')
   .option('-o, --out <dir>', 'download directory', process.cwd())
   .option('--down-limit <rate>', 'max overall download speed, e.g. 5M or 500K (0 = unlimited)', '500M')
-  .option('--up-limit <rate>', 'max overall upload speed, e.g. 1M (0 = unlimited)', '50M')
+  .option('--up-limit <rate>', 'max upload (seeding) speed while downloading, e.g. 500K (0 = unlimited)', '1M')
   .option('--1080p', 'prefer 1080p (headless selection hint)')
   .option('--720p', 'prefer 720p (headless selection hint)')
   .option('--4k', 'prefer 4K/2160p (headless selection hint)')
