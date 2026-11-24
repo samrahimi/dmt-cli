@@ -11,6 +11,10 @@
 //    ever seeded. Upload is capped at 1 MB/s by default (`upLimit`).
 //  * In RPC mode aria2 never exits on its own, even once every download has
 //    finished, so we detect completion by polling and shut it down ourselves.
+//    We call it done the moment the content is fully downloaded and verified
+//    (aria2 reports itself a seeder) rather than waiting for aria2 to move the
+//    download to its "stopped" queue: that hand-off depends on aria2 winding
+//    down seeding, peers and tracker announces, and can take arbitrarily long.
 //  * Downloads resume. aria2 keeps a control file and, with
 //    `--check-integrity=true`, hash-verifies whatever is already on disk on
 //    startup — so an interrupted transfer continues from where it left off.
@@ -32,6 +36,9 @@ const STATUS_KEYS = [
   'uploadLength',
   'connections',
   'numSeeders',
+  'seeder',
+  'verifiedLength',
+  'verifyIntegrityPending',
   'bittorrent',
   'files',
 ];
@@ -49,9 +56,12 @@ function randomSecret() {
   return Math.random().toString(36).slice(2) + Date.now().toString(36);
 }
 
-async function rpc(port, secret, method, params = []) {
+// Every call is time-boxed: a request that never answers would otherwise wedge
+// the poll loop (and with it the whole process) forever.
+async function rpc(port, secret, method, params = [], timeoutMs = 5000) {
   const res = await fetch(`http://127.0.0.1:${port}/jsonrpc`, {
     method: 'POST',
+    signal: AbortSignal.timeout(timeoutMs),
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
       jsonrpc: '2.0',
@@ -75,10 +85,28 @@ function pickDownload(active) {
     .sort((a, b) => Number(b.totalLength || 0) - Number(a.totalLength || 0))[0];
 }
 
+// True once a torrent's payload is entirely on disk and hash-verified. aria2
+// keeps such a download "active" while it seeds / winds down, so this — not the
+// download leaving the active queue — is our completion signal. Magnet metadata
+// fetches (no `info` yet) and in-progress integrity checks never qualify.
+function isContentComplete(d) {
+  const total = Number(d.totalLength || 0);
+  return (
+    Boolean(d.bittorrent?.info) &&
+    total > 0 &&
+    Number(d.completedLength || 0) >= total &&
+    d.seeder === 'true' &&
+    d.verifyIntegrityPending !== 'true' &&
+    d.verifiedLength === undefined
+  );
+}
+
 function progressLine(d) {
   const total = Number(d.totalLength || 0);
   const done = Number(d.completedLength || 0);
   const progress = total ? Math.min(done / total, 1) : 0;
+  // Round down so "100.0%" is only ever shown when every byte has arrived.
+  const pct = Math.floor(progress * 1000) / 10;
   const dl = Number(d.downloadSpeed || 0);
   const ul = Number(d.uploadSpeed || 0);
   const uploaded = Number(d.uploadLength || 0);
@@ -86,7 +114,7 @@ function progressLine(d) {
   const seeds = Number(d.numSeeders || 0);
   const eta = dl > 0 ? (total - done) / dl : Infinity;
   return (
-    `${renderBar(progress)} ${(progress * 100).toFixed(1)}%  ` +
+    `${renderBar(progress)} ${pct.toFixed(1)}%  ` +
     `${humanBytes(done)} / ${humanBytes(total)}  ` +
     `↓ ${humanSpeed(dl)}  ↑ ${humanSpeed(ul)} (${humanBytes(uploaded)} sent)  ` +
     `peers:${conn} seeds:${seeds}  ` +
@@ -219,17 +247,41 @@ function attemptDownload(input, { out, quiet, resuming, downLimit = '500M', upLi
       }
     }
 
+    const exited = new Promise((r) => child.once('exit', r));
+    const hasExited = () => child.exitCode !== null || child.signalCode !== null;
+
+    // Stop aria2 and wait (briefly) until it is really gone, so we never leave
+    // an orphan behind or return while it still holds files/ports. forceShutdown
+    // closes files cleanly but skips the slow tracker goodbyes; if aria2 doesn't
+    // comply within a few seconds it gets SIGKILLed.
+    async function stopAria() {
+      if (!child.pid || hasExited()) return;
+      try {
+        await rpc(port, secret, 'aria2.forceShutdown', [], 2000);
+      } catch {
+        try {
+          child.kill();
+        } catch {
+          /* ignore */
+        }
+      }
+      await Promise.race([exited, delay(4000)]);
+      if (!hasExited()) {
+        try {
+          child.kill('SIGKILL');
+        } catch {
+          /* ignore */
+        }
+        await Promise.race([exited, delay(1000)]);
+      }
+    }
+
     function finish(fn) {
       if (settled) return;
       settled = true;
       if (ticker) clearInterval(ticker);
       clearLine();
-      try {
-        if (!child.killed) child.kill();
-      } catch {
-        /* ignore */
-      }
-      fn();
+      stopAria().then(fn, fn);
     }
 
     child.stderr.on('data', (chunk) => {
@@ -283,6 +335,12 @@ function attemptDownload(input, { out, quiet, resuming, downLimit = '500M', upLi
         if (d) {
           last = d;
           render(d);
+          // Fully downloaded and verified: we're done, even though aria2 still
+          // lists it as active. Don't wait for it to wind down.
+          if (active.every(isContentComplete)) {
+            const waiting = await rpc(port, secret, 'aria2.tellWaiting', [0, 1000, ['gid']]);
+            if (waiting.length === 0) complete(d);
+          }
         } else {
           const done = await checkFinished(port, secret);
           if (done) {
